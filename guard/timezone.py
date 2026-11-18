@@ -2,6 +2,7 @@ import ctypes
 import json
 import re
 import time
+from collections import Counter
 from pathlib import Path
 
 from .system import run
@@ -9,19 +10,27 @@ from .system import run
 ZONES = json.loads((Path(__file__).parent / 'data/timezones.json').read_text(encoding='utf-8'))
 
 
+class GeoDataError(RuntimeError):
+    pass
+
+
+def majority(values):
+    ranked = Counter(values).most_common(2)
+    if not ranked or len(ranked) == 2 and ranked[0][1] == ranked[1][1]:
+        return None
+    return ranked[0][0]
+
+
 def target_zone(results):
     if not results or not all(value.safe for value in results):
         raise RuntimeError('Часовой пояс нельзя менять без безопасных ответов GeoIP')
-    countries = {value.country for value in results}
-    if len(countries) != 1:
-        raise RuntimeError('GeoIP-сервисы определили разные страны')
-    country = next(iter(countries))
-    zones = {value.timezone for value in results if value.timezone}
-    if len(zones) != 1:
-        raise RuntimeError('GeoIP не сообщил единственный часовой пояс')
-    zone = next(iter(zones))
-    if country not in ZONES.get(zone, []):
-        raise RuntimeError('Часовой пояс GeoIP не соответствует определённой стране')
+    country = majority(value.country for value in results)
+    if country is None:
+        raise GeoDataError('GeoIP-сервисы определили разные страны без явного большинства')
+    zone = majority(value.timezone for value in results
+                    if value.country == country and country in ZONES.get(value.timezone, []))
+    if zone is None:
+        raise GeoDataError('GeoIP не сообщил единственный часовой пояс для определённой страны')
     return zone
 
 

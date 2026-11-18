@@ -3,6 +3,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from .config import resolve_proxy
 from .probe import Result, check, curl_path, sources
+from .timezone import GeoDataError
 
 
 def monitor(cfg, controller, console, once=False):
@@ -25,7 +26,7 @@ def monitor(cfg, controller, console, once=False):
         print('До получения ответов сервисов соединение ещё не проверено.', flush=True)
     pool = ThreadPoolExecutor(max_workers=len(providers))
     started = time.monotonic()
-    confirmed = False
+    synced = False
     rounds = 0
     try:
         while True:
@@ -55,42 +56,32 @@ def monitor(cfg, controller, console, once=False):
                         console.table(results, names, 'ОБНАРУЖЕНА УТЕЧКА', proxy, rounds)
                         console.cut(report, reason)
                         return
-                    if not value.safe and confirmed and not once:
-                        reason = f'Нельзя подтвердить безопасный IP: {value.name}'
-                        report = controller.cut(reason)
-                        for name in names:
-                            results.setdefault(name, Result(name, error='Нет ответа к моменту отключения'))
-                        console.table(results, names, 'ПРОВЕРКА НЕ ПРОЙДЕНА', proxy, rounds)
-                        console.cut(report, reason)
-                        return
                     console.table(results, names, 'ПРОВЕРЯЮ IP', proxy, rounds)
-            safe = len(results) == len(providers) and all(x.safe for x in results.values())
+            confirmed = [x for x in results.values() if x.safe]
+            safe = bool(confirmed) and not any(x.country == 'RU' for x in results.values())
             if safe and not once:
-                reason = ''
-                if len({x.country for x in results.values()}) != 1:
-                    reason = 'GeoIP-сервисы видят разные страны: возможны разные маршруты или неточные данные'
-                else:
-                    try:
-                        console.timezone = controller.sync_timezone(list(results.values()))
-                    except Exception as exc:
-                        reason = f'Не удалось подтвердить часовой пояс по IP: {exc}'
-                if reason:
+                try:
+                    console.timezone = controller.sync_timezone(confirmed)
+                    synced = True
+                except GeoDataError:
+                    pass
+                except Exception as exc:
                     if hasattr(console, 'timezone'):
                         del console.timezone
+                    reason = f'Не удалось подтвердить часовой пояс по IP: {exc}'
                     report = controller.cut(reason)
                     console.table(results, names, 'ПРОВЕРКА ПРИВАТНОСТИ НЕ ПРОЙДЕНА', proxy, rounds)
                     console.cut(report, reason)
                     return
-            if safe:
-                confirmed = True
-            title = 'ВСЕ СЕРВИСЫ: IP НЕ ИЗ РФ' if safe else 'НЕ ВСЕ СЕРВИСЫ ПОДТВЕРДИЛИ СТРАНУ'
+            title = f'IP НЕ ИЗ РФ: ПОДТВЕРДИЛИ {len(confirmed)} ИЗ {len(providers)}' if safe else 'НИ ОДИН СЕРВИС НЕ ПОДТВЕРДИЛ СТРАНУ'
             if once and any(x.country == 'RU' for x in results.values()):
                 title = 'ОБНАРУЖЕНА РФ — ПРОСМОТР БЕЗ ОТКЛЮЧЕНИЯ'
             console.table(results, names, title, proxy, rounds)
             if once:
                 return
-            if not safe and time.monotonic() - started >= cfg['startup_timeout']:
-                reason = 'Истекло время начальной проверки: безопасный IP не подтверждён'
+            if time.monotonic() - started >= cfg['startup_timeout'] and (not safe or not synced):
+                reason = ('Истекло время начальной проверки: часовой пояс по IP не подтверждён' if safe
+                          else 'Ни один сервис не подтвердил безопасный IP')
                 report = controller.cut(reason)
                 console.cut(report, reason)
                 return

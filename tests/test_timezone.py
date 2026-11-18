@@ -62,6 +62,15 @@ class ZoneSelectionTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             target_zone(data)
 
+    def test_majority_country_and_zone_win_over_inaccurate_source(self):
+        data = results('NL', 'Europe/Amsterdam') + [Result('ifconfig.co', '8.8.8.8', 'FR', timezone='Europe/Paris')]
+        self.assertEqual(target_zone(data), 'Europe/Amsterdam')
+
+    def test_lack_of_geo_data_is_distinguished_from_other_failures(self):
+        from guard.timezone import GeoDataError
+        with self.assertRaises(GeoDataError):
+            target_zone([Result('Cloudflare', '8.8.8.8', 'DE')])
+
     def test_missing_unknown_or_wrong_country_timezone_rejected(self):
         for zone in ('', 'Not/A_Timezone', 'Europe/Moscow', '../../private/file'):
             with self.subTest(zone=zone), self.assertRaises(RuntimeError):
@@ -229,12 +238,26 @@ class AutoPrivacyTests(unittest.TestCase):
         cfg = {'proxy': 'direct', 'request_timeout': 0.01, 'check_interval': 0.01, 'startup_timeout': 0.01}
         return cfg, controller, console, backend
 
-    def test_country_disagreement_cuts_network_without_timezone_change(self):
+    def test_country_disagreement_uses_majority_without_cut(self):
         from guard.monitor import monitor
         cfg, controller, console, backend = self.setup_monitor()
 
         def check(source, *_):
             return Result(source['name'], '8.8.8.8', 'DE' if source['name'] == 'Cloudflare' else 'NL', timezone='Europe/Amsterdam')
+
+        with patch('guard.monitor.curl_path'), patch('guard.monitor.check', side_effect=check), patch('guard.network.is_admin', return_value=True), patch('guard.monitor.time.sleep', side_effect=KeyboardInterrupt), contextlib.redirect_stdout(io.StringIO()):
+            monitor(cfg, controller, console)
+        self.assertFalse(controller.blocked)
+        self.assertEqual(backend.zone, 'Europe/Amsterdam')
+
+    def test_country_tie_without_timezone_cuts_after_startup_deadline(self):
+        from guard.monitor import monitor
+        cfg, controller, console, backend = self.setup_monitor()
+
+        def check(source, *_):
+            if source['name'] in ('Cloudflare', 'IP.SB'):
+                return Result(source['name'], '8.8.8.8', 'DE' if source['name'] == 'Cloudflare' else 'NL', timezone='Europe/Amsterdam')
+            return Result(source['name'], error='timeout')
 
         with patch('guard.monitor.curl_path'), patch('guard.monitor.check', side_effect=check), patch('guard.network.is_admin', return_value=True):
             monitor(cfg, controller, console)

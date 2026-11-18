@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .countries import COUNTRIES
-from .sources import APPROVED_SOURCES, validate_source
+from .sources import APPROVED_SOURCES, SOURCE_NAMES, validate_source
 
 
 @dataclass(frozen=True)
@@ -25,8 +25,7 @@ class Result:
 
 
 def sources():
-    return [dict(name=name, url=url, **APPROVED_SOURCES[url]) for name, url in
-            (("Cloudflare", "https://www.cloudflare.com/cdn-cgi/trace"), ("IP.SB", "https://api.ip.sb/geoip"))]
+    return [dict(name=name, url=url, **APPROVED_SOURCES[url]) for name, url in SOURCE_NAMES]
 
 
 def parse(source, body):
@@ -42,7 +41,7 @@ def parse(source, body):
     address = ipaddress.ip_address(data.get(source["ip_field"], ""))
     if not address.is_global or address.is_multicast:
         raise ValueError("Сервис не сообщил публичный IP")
-    zone = data.get('timezone', '')
+    zone = data.get(source.get('timezone_field', ''), '')
     zone = zone if isinstance(zone, str) and len(zone) <= 120 and re.fullmatch(r'[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+)*', zone) else ''
     return Result(source["name"], str(address), country.upper(), timezone=zone)
 

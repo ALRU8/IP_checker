@@ -20,7 +20,21 @@ from guard.system import MacAdapters, parse_mac_hardware, parse_mac_services
 
 class ProbeTests(unittest.TestCase):
     def test_foreign_sources_only(self):
-        self.assertEqual({s['url'] for s in sources()}, {'https://www.cloudflare.com/cdn-cgi/trace', 'https://api.ip.sb/geoip'})
+        from guard.sources import APPROVED_SOURCES
+        self.assertEqual({s['url'] for s in sources()}, set(APPROVED_SOURCES))
+        self.assertGreaterEqual(len(sources()), 8)
+        self.assertTrue(all(s['url'].startswith('https://') and '.ru/' not in s['url'] for s in sources()))
+
+    def test_every_source_parses_its_own_format(self):
+        for source in sources():
+            if source['format'] == 'trace':
+                body = f"ip=8.8.8.8\n{source['country_field']}=DE\n"
+            else:
+                body = json.dumps({source['ip_field']: '8.8.8.8', source['country_field']: 'DE', source.get('timezone_field', 'x'): 'Europe/Berlin'})
+            with self.subTest(source=source['name']):
+                result = parse(source, body)
+                self.assertTrue(result.safe)
+                self.assertEqual(result.timezone, 'Europe/Berlin' if 'timezone_field' in source else '')
 
     def test_reads_country_and_ipv4(self):
         self.assertEqual(parse(sources()[0], 'ip=8.8.8.8\nloc=RU\n').country, 'RU')
@@ -348,6 +362,70 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(self.events, [])
 
     def test_timeout_at_start_disables_after_startup_deadline(self):
+        with patch('guard.monitor.curl_path'), patch('guard.monitor.check', side_effect=lambda source, *_: Result(source['name'], error='timeout')), patch('guard.network.is_admin', return_value=True):
+            monitor(self.cfg, self.controller, self.console)
+        self.assertTrue(self.controller.blocked)
+
+    def run_rounds(self, check, rounds=3, sync=lambda results: 'Europe/Berlin'):
+        self.cfg['startup_timeout'] = 60
+        calls = []
+
+        def counted(source, *args):
+            calls.append(source['name'])
+            if len(calls) > rounds * len(sources()):
+                raise KeyboardInterrupt
+            return check(source)
+
+        def guarded(*args):
+            if len(calls) >= rounds * len(sources()):
+                raise KeyboardInterrupt
+            return None
+
+        console = type('Console', (), {'table': guarded, 'cut': lambda *args: None})()
+        with patch('guard.monitor.curl_path'), patch('guard.monitor.check', side_effect=counted), patch('guard.network.is_admin', return_value=True), patch.object(self.controller, 'sync_timezone', side_effect=sync) as synced, contextlib.redirect_stdout(io.StringIO()):
+            monitor(self.cfg, self.controller, console)
+        return synced
+
+    def test_timeouts_do_not_disable_when_one_source_is_safe(self):
+        def check(source):
+            if source['name'] == 'IP.SB':
+                return Result(source['name'], '8.8.4.4', 'DE', timezone='Europe/Berlin')
+            return Result(source['name'], error='Нет ответа (curl 28)')
+
+        synced = self.run_rounds(check)
+        self.assertFalse(self.controller.blocked)
+        self.assertEqual([x.name for x in synced.call_args.args[0]], ['IP.SB'])
+
+    def test_missing_timezone_after_sync_does_not_disable(self):
+        state = {'round': 0}
+
+        def check(source):
+            if source['name'] == 'IP.SB':
+                state['round'] += 1
+                if state['round'] == 1:
+                    return Result(source['name'], '8.8.4.4', 'DE', timezone='Europe/Berlin')
+                return Result(source['name'], error='timeout')
+            if source['name'] == 'Cloudflare':
+                return Result(source['name'], '8.8.8.8', 'DE')
+            return Result(source['name'], error='timeout')
+
+        from guard.timezone import target_zone
+        self.run_rounds(check, sync=target_zone)
+        self.assertFalse(self.controller.blocked)
+
+    def test_ru_among_timeouts_still_disables(self):
+        def check(source):
+            if source['name'] == 'ifconfig.co':
+                return Result(source['name'], '8.8.8.8', 'RU')
+            if source['name'] == 'IP.SB':
+                return Result(source['name'], '8.8.4.4', 'DE', timezone='Europe/Berlin')
+            return Result(source['name'], error='timeout')
+
+        self.run_rounds(check)
+        self.assertTrue(self.controller.blocked)
+
+    def test_all_sources_timing_out_disables_after_deadline(self):
+        self.cfg['startup_timeout'] = 0.01
         with patch('guard.monitor.curl_path'), patch('guard.monitor.check', side_effect=lambda source, *_: Result(source['name'], error='timeout')), patch('guard.network.is_admin', return_value=True):
             monitor(self.cfg, self.controller, self.console)
         self.assertTrue(self.controller.blocked)
